@@ -1,0 +1,114 @@
+name: Preview Email Format
+
+# 只读数据库、不改任何进度：用已有摘要按「生产格式」发一封预览邮件，
+# 用来在完整跑完一次之后先看看正文 / 附件长什么样（不会重跑 ASR/OCR）。
+on:
+  workflow_dispatch:
+    inputs:
+      per_course:
+        description: "每门课取最近几讲（默认 1）"
+        required: false
+        default: "1"
+      max_courses:
+        description: "最多取几门课，0 = 不限（默认 3）"
+        required: false
+        default: "3"
+      course_id:
+        description: "只预览指定课程 ID（留空 = 多门课各取几讲）"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  preview:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install minimal dependencies
+        # 预览不需要 ASR / OCR，装最小集即可，跑起来一两分钟
+        run: pip install --quiet requests pycryptodome pillow markdown pygments
+
+      - name: Fetch database from data branch
+        run: |
+          mkdir -p data
+          if ! git fetch origin data --depth=1 2>/dev/null; then
+            echo "::error::data 分支不存在或拉取失败：先成功跑一次 iCourse Check 再预览。"
+            exit 1
+          fi
+          if git cat-file -e origin/data:data/icourse-index.enc 2>/dev/null; then
+            mkdir -p data/sharded/shards
+            git show origin/data:data/icourse-index.enc > data/sharded/icourse-index.enc
+            shard_paths=$(git ls-tree -r --name-only origin/data | grep '^data/shards/' || true)
+            for path in $shard_paths; do
+              base=$(basename "$path")
+              git show "origin/data:$path" > "data/sharded/shards/$base"
+            done
+            echo "Loaded $(ls data/sharded/shards 2>/dev/null | wc -l) shard(s)."
+          elif git cat-file -e origin/data:data/icourse.db.gz.enc 2>/dev/null; then
+            git show origin/data:data/icourse.db.gz.enc > data/icourse.db.gz.enc
+          elif git cat-file -e origin/data:data/icourse.db.enc 2>/dev/null; then
+            git show origin/data:data/icourse.db.enc > data/icourse.db.enc
+          else
+            echo "::error::data 分支上没有数据库文件。"
+            exit 1
+          fi
+
+      - name: Decode database
+        env:
+          STUID: ${{ secrets.STUID }}
+          UISPSW: ${{ secrets.UISPSW }}
+          DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+        run: |
+          if [ -f data/sharded/icourse-index.enc ]; then
+            python scripts/db_shard.py reassemble data/sharded data/icourse.db
+            echo "Reassembled sharded database."
+            exit 0
+          fi
+
+          NEW_KEY=$(printf '%s' "ICSv2:${STUID}:${UISPSW}" | sha256sum | cut -d' ' -f1)
+          LEGACY_KEY="${STUID}${UISPSW}${DASHSCOPE_API_KEY}${SMTP_PASSWORD}"
+
+          decrypt_blob() {
+            local in_path="$1"
+            local out_path="$2"
+            if openssl enc -aes-256-cbc -d -pbkdf2 -iter 100000 \
+                 -in "$in_path" -out "$out_path" -pass pass:"$NEW_KEY" 2>/dev/null; then
+              return 0
+            fi
+            openssl enc -aes-256-cbc -d -pbkdf2 \
+              -in "$in_path" -out "$out_path" -pass pass:"$LEGACY_KEY" 2>/dev/null
+          }
+
+          if [ -f data/icourse.db.gz.enc ]; then
+            decrypt_blob data/icourse.db.gz.enc data/icourse.db.gz
+            gzip -d data/icourse.db.gz
+          else
+            decrypt_blob data/icourse.db.enc data/icourse.db
+          fi
+          echo "Database decrypted."
+
+      - name: Send preview email
+        env:
+          SMTP_EMAIL: ${{ secrets.SMTP_EMAIL }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
+          PER_COURSE: ${{ inputs.per_course }}
+          MAX_COURSES: ${{ inputs.max_courses }}
+          COURSE_ID: ${{ inputs.course_id }}
+        run: |
+          ARGS="--per-course $PER_COURSE --max-courses $MAX_COURSES"
+          if [ -n "$COURSE_ID" ]; then
+            ARGS="$ARGS --course-id $COURSE_ID"
+          fi
+          python scripts/preview_email.py $ARGS
