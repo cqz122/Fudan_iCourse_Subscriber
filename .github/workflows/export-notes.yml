@@ -1,0 +1,127 @@
+name: Export Course Notes (no email)
+
+# 把某门课的笔记导出成 Markdown 并上传为 artifact，不发邮件、不改数据库。
+# 用法：填课程名（子串匹配，如「集合与图论」）或课程 ID，跑完在 run 页面底部下载 artifact。
+on:
+  workflow_dispatch:
+    inputs:
+      course_title:
+        description: "课程名（子串匹配，如：集合与图论）"
+        required: false
+        default: ""
+      course_id:
+        description: "课程 ID（精确，填了就忽略课程名）"
+        required: false
+        default: ""
+      split:
+        description: "是否每讲单独一个文件"
+        type: choice
+        options:
+          - "yes"
+          - "no"
+        default: "yes"
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install minimal dependencies
+        run: pip install --quiet requests pycryptodome pillow markdown pygments
+
+      - name: Fetch database from data branch
+        run: |
+          mkdir -p data
+          if ! git fetch origin data --depth=1 2>/dev/null; then
+            echo "::error::data 分支不存在或拉取失败。"
+            exit 1
+          fi
+          if git cat-file -e origin/data:data/icourse-index.enc 2>/dev/null; then
+            mkdir -p data/sharded/shards
+            git show origin/data:data/icourse-index.enc > data/sharded/icourse-index.enc
+            shard_paths=$(git ls-tree -r --name-only origin/data | grep '^data/shards/' || true)
+            for path in $shard_paths; do
+              base=$(basename "$path")
+              git show "origin/data:$path" > "data/sharded/shards/$base"
+            done
+            echo "Loaded $(ls data/sharded/shards 2>/dev/null | wc -l) shard(s)."
+          elif git cat-file -e origin/data:data/icourse.db.gz.enc 2>/dev/null; then
+            git show origin/data:data/icourse.db.gz.enc > data/icourse.db.gz.enc
+          elif git cat-file -e origin/data:data/icourse.db.enc 2>/dev/null; then
+            git show origin/data:data/icourse.db.enc > data/icourse.db.enc
+          else
+            echo "::error::data 分支上没有数据库文件。"
+            exit 1
+          fi
+
+      - name: Decode database
+        env:
+          STUID: ${{ secrets.STUID }}
+          UISPSW: ${{ secrets.UISPSW }}
+          DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+        run: |
+          if [ -f data/sharded/icourse-index.enc ]; then
+            python scripts/db_shard.py reassemble data/sharded data/icourse.db
+            echo "Reassembled sharded database."
+            exit 0
+          fi
+
+          NEW_KEY=$(printf '%s' "ICSv2:${STUID}:${UISPSW}" | sha256sum | cut -d' ' -f1)
+          LEGACY_KEY="${STUID}${UISPSW}${DASHSCOPE_API_KEY}${SMTP_PASSWORD}"
+
+          decrypt_blob() {
+            local in_path="$1"
+            local out_path="$2"
+            if openssl enc -aes-256-cbc -d -pbkdf2 -iter 100000 \
+                 -in "$in_path" -out "$out_path" -pass pass:"$NEW_KEY" 2>/dev/null; then
+              return 0
+            fi
+            openssl enc -aes-256-cbc -d -pbkdf2 \
+              -in "$in_path" -out "$out_path" -pass pass:"$LEGACY_KEY" 2>/dev/null
+          }
+
+          if [ -f data/icourse.db.gz.enc ]; then
+            decrypt_blob data/icourse.db.gz.enc data/icourse.db.gz
+            gzip -d data/icourse.db.gz
+          else
+            decrypt_blob data/icourse.db.enc data/icourse.db
+          fi
+          echo "Database decrypted."
+
+      - name: Export notes
+        env:
+          TITLE: ${{ inputs.course_title }}
+          CID: ${{ inputs.course_id }}
+          SPLIT: ${{ inputs.split }}
+        run: |
+          ARGS="--db data/icourse.db --out notes"
+          if [ -n "$CID" ]; then
+            ARGS="$ARGS --course-id $CID"
+          fi
+          if [ -n "$TITLE" ]; then
+            ARGS="$ARGS --title $TITLE"
+          fi
+          if [ "$SPLIT" = "no" ]; then
+            ARGS="$ARGS --no-split"
+          fi
+          python scripts/export_notes.py $ARGS
+
+      - name: Upload notes
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: course-notes
+          path: notes/
+          retention-days: 7
